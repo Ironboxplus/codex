@@ -107,7 +107,12 @@ fn server_notification_requires_delivery(notification: &ServerNotification) -> b
         notification,
         ServerNotification::TurnCompleted(_)
             | ServerNotification::ThreadSettingsUpdated(_)
+            | ServerNotification::ItemCompleted(_)
             | ServerNotification::ExternalAgentConfigImportCompleted(_)
+            | ServerNotification::AgentMessageDelta(_)
+            | ServerNotification::PlanDelta(_)
+            | ServerNotification::ReasoningSummaryTextDelta(_)
+            | ServerNotification::ReasoningTextDelta(_)
     )
 }
 
@@ -887,6 +892,77 @@ mod tests {
             .shutdown()
             .await
             .expect("in-process runtime should shutdown cleanly");
+    }
+
+    #[tokio::test]
+    async fn item_completed_waits_for_event_queue_capacity() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        event_tx
+            .send(InProcessServerEvent::ServerNotification(
+                ServerNotification::TurnCompleted(TurnCompletedNotification {
+                    thread_id: "thread-1".to_string(),
+                    turn: Turn {
+                        id: "turn-1".to_string(),
+                        items: Vec::new(),
+                        items_view: TurnItemsView::NotLoaded,
+                        status: TurnStatus::Completed,
+                        error: None,
+                        started_at: None,
+                        completed_at: Some(0),
+                        duration_ms: None,
+                    },
+                }),
+            ))
+            .await
+            .expect("initial event should fill the queue");
+
+        let notification = ServerNotification::ItemCompleted(
+            codex_app_server_protocol::ItemCompletedNotification {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                completed_at_ms: 0,
+                item: codex_app_server_protocol::ThreadItem::AgentMessage {
+                    id: "item-1".to_string(),
+                    text: "done".to_string(),
+                    phase: None,
+                    memory_citation: None,
+                },
+            },
+        );
+        let mut send_task = tokio::spawn(async move {
+            if server_notification_requires_delivery(&notification) {
+                event_tx
+                    .send(InProcessServerEvent::ServerNotification(notification))
+                    .await
+                    .is_ok()
+            } else {
+                event_tx
+                    .try_send(InProcessServerEvent::ServerNotification(notification))
+                    .is_ok()
+            }
+        });
+
+        assert!(
+            timeout(Duration::from_millis(25), &mut send_task)
+                .await
+                .is_err(),
+            "item/completed must wait instead of being dropped when the queue is full"
+        );
+        let _ = event_rx
+            .recv()
+            .await
+            .expect("initial event should still be queued");
+        assert!(
+            send_task
+                .await
+                .expect("notification sender task should join")
+        );
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(InProcessServerEvent::ServerNotification(
+                ServerNotification::ItemCompleted(_)
+            ))
+        ));
     }
 
     #[test]

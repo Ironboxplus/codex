@@ -4,9 +4,11 @@ use std::time::Duration;
 
 use anyhow::Result;
 use bytes::Bytes;
+use codex_api::ApiError;
 use codex_api::AuthProvider;
 use codex_api::Compression;
 use codex_api::Provider;
+use codex_api::ReqwestTransport;
 use codex_api::ResponseEvent;
 use codex_api::ResponsesClient;
 use codex_client::HttpTransport;
@@ -20,6 +22,8 @@ use http::HeaderMap;
 use http::StatusCode;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
+use tokio::io::AsyncReadExt;
+use tokio::net::TcpListener;
 
 #[derive(Clone)]
 struct FixtureSseTransport {
@@ -166,5 +170,50 @@ async fn responses_stream_parses_items_and_completed_end_to_end() -> Result<()> 
         other => panic!("unexpected third event: {other:?}"),
     }
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn responses_stream_times_out_before_server_sends_response_headers() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener
+            .accept()
+            .await
+            .expect("test server should accept the request");
+        let mut request = [0_u8; 1024];
+        let bytes_read = socket
+            .read(&mut request)
+            .await
+            .expect("test server should receive the request");
+        assert!(bytes_read > 0, "test server should receive request bytes");
+        std::future::pending::<()>().await;
+    });
+
+    let mut provider = provider("pending-response-headers");
+    provider.base_url = format!("http://{address}/v1");
+    provider.retry.max_attempts = 0;
+    provider.stream_idle_timeout = Duration::from_millis(50);
+
+    let transport = ReqwestTransport::new(reqwest::Client::builder().no_proxy().build()?);
+    let client = ResponsesClient::new(transport, provider, Arc::new(NoAuth));
+    let result = tokio::time::timeout(
+        Duration::from_millis(500),
+        client.stream(
+            serde_json::json!({"echo": true}),
+            HeaderMap::new(),
+            Compression::None,
+            /*turn_state*/ None,
+        ),
+    )
+    .await
+    .expect("response header wait should finish before the outer timeout");
+
+    server.abort();
+    assert!(matches!(
+        result,
+        Err(ApiError::Transport(TransportError::Timeout))
+    ));
     Ok(())
 }
