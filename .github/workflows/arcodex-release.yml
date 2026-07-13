@@ -124,7 +124,6 @@ jobs:
           $env:SCCACHE_GHA_ENABLED = "false"
           $env:SCCACHE_DIR = $sccacheDir
           sccache --start-server
-          sccache --max-cache-size 5G
           Write-Host "sccache directory: $sccacheDir"
           Write-Host "Cargo build jobs: $([Environment]::ProcessorCount)"
 
