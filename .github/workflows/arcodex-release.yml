@@ -98,18 +98,34 @@ jobs:
           restore-keys: |
             arcodex-cargo-home-${{ runner.os }}-
 
+      - name: Restore sccache cache
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: arcodex-sccache-${{ runner.os }}-${{ hashFiles('codex-rs/Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: |
+            arcodex-sccache-${{ runner.os }}-${{ hashFiles('codex-rs/Cargo.lock') }}-
+            arcodex-sccache-${{ runner.os }}-
+
       - name: Install sccache
         uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
         with:
-          tool: sccache
-          version: 0.7.5
+          tool: sccache@0.12.0
 
       - name: Configure sccache and parallel Cargo builds
         shell: pwsh
         run: |
-          "SCCACHE_GHA_ENABLED=true" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $sccacheDir = Join-Path $env:GITHUB_WORKSPACE ".sccache"
+          New-Item -ItemType Directory -Path $sccacheDir -Force | Out-Null
+          "SCCACHE_GHA_ENABLED=false" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SCCACHE_DIR=$sccacheDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "RUSTC_WRAPPER=sccache" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "CARGO_BUILD_JOBS=$([Environment]::ProcessorCount)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $env:SCCACHE_GHA_ENABLED = "false"
+          $env:SCCACHE_DIR = $sccacheDir
+          sccache --start-server
+          sccache --max-cache-size 5G
+          Write-Host "sccache directory: $sccacheDir"
           Write-Host "Cargo build jobs: $([Environment]::ProcessorCount)"
 
       - name: Build canonical Windows package
