@@ -1,0 +1,266 @@
+name: arcodex-release
+
+on:
+  push:
+    tags:
+      - "arcodex-v*"
+
+concurrency:
+  group: arcodex-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build, verify, and publish @ironbox/arcodex
+    if: github.repository == 'Ironboxplus/codex'
+    runs-on: windows-latest
+    timeout-minutes: 240
+    permissions:
+      contents: read
+    env:
+      TARGET: x86_64-pc-windows-msvc
+      PACKAGE_NAME: "@ironbox/arcodex"
+
+    steps:
+      - name: Checkout tagged source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Resolve and validate release version
+        id: release
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ($tag -notmatch '^arcodex-v(?<version>[0-9]+\.[0-9]+\.[0-9]+-arc\.[0-9]+)$') {
+            throw "Invalid release tag '$tag'. Expected arcodex-vX.Y.Z-arc.N."
+          }
+          $version = $Matches.version
+
+          $cargoToml = Get-Content -LiteralPath "codex-rs/Cargo.toml" -Raw
+          $workspaceVersionMatch = [regex]::Match(
+            $cargoToml,
+            '(?ms)^\[workspace\.package\]\s*$.*?^version\s*=\s*"(?<version>[^"]+)"'
+          )
+          if (-not $workspaceVersionMatch.Success) {
+            throw "Could not read [workspace.package].version from codex-rs/Cargo.toml."
+          }
+          $cargoVersion = $workspaceVersionMatch.Groups['version'].Value
+
+          if ($version -notmatch ('^' + [regex]::Escape($cargoVersion) + '-arc\.[0-9]+$')) {
+            throw "Tag version '$version' is not based on workspace version '$cargoVersion'."
+          }
+
+          $tarball = "dist/ironbox-arcodex-$version-win32-x64.tgz"
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "cargo_version=$cargoVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "tarball=$tarball" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+          Write-Host "Tag: $tag"
+          Write-Host "npm version: $version"
+          Write-Host "Codex version: $cargoVersion"
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.13"
+
+      - name: Set up Node.js and npm registry
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: 24
+          registry-url: "https://registry.npmjs.org"
+          scope: "@ironbox"
+
+      - name: Configure CI build directories and tools
+        id: setup_ci
+        uses: ./.github/actions/setup-ci
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          toolchain: 1.95.0
+          targets: x86_64-pc-windows-msvc
+
+      - name: Configure MSVC environment
+        uses: ./.github/actions/setup-msvc-env
+        with:
+          target: x86_64-pc-windows-msvc
+
+      - name: Restore Cargo download cache
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: arcodex-cargo-home-${{ runner.os }}-${{ hashFiles('codex-rs/Cargo.lock') }}
+          restore-keys: |
+            arcodex-cargo-home-${{ runner.os }}-
+
+      - name: Install sccache
+        uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: sccache
+          version: 0.7.5
+
+      - name: Configure sccache and parallel Cargo builds
+        shell: pwsh
+        run: |
+          "SCCACHE_GHA_ENABLED=true" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RUSTC_WRAPPER=sccache" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CARGO_BUILD_JOBS=$([Environment]::ProcessorCount)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Cargo build jobs: $([Environment]::ProcessorCount)"
+
+      - name: Build canonical Windows package
+        id: native
+        shell: pwsh
+        env:
+          LIBSQLITE3_FLAGS: SQLITE_DISABLE_INTRINSIC
+        run: |
+          $vendorRoot = Join-Path $env:RUNNER_TEMP "arcodex-vendor"
+          $packageDir = Join-Path $vendorRoot $env:TARGET
+
+          python scripts/build_codex_package.py `
+            --target $env:TARGET `
+            --variant codex `
+            --package-dir $packageDir `
+            --cargo-profile release
+          if ($LASTEXITCODE -ne 0) {
+            throw "Canonical Windows package build failed."
+          }
+
+          "vendor_root=$vendorRoot" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Build scoped npm tarball
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          TARBALL: ${{ steps.release.outputs.tarball }}
+          VENDOR_ROOT: ${{ steps.native.outputs.vendor_root }}
+        run: |
+          New-Item -ItemType Directory -Path "dist" -Force | Out-Null
+          python codex-cli/scripts/build_npm_package.py `
+            --package arcodex `
+            --release-version $env:RELEASE_VERSION `
+            --vendor-src $env:VENDOR_ROOT `
+            --pack-output $env:TARBALL
+          if ($LASTEXITCODE -ne 0) {
+            throw "npm tarball build failed."
+          }
+
+      - name: Verify package metadata and isolated install
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          CODEX_VERSION: ${{ steps.release.outputs.cargo_version }}
+          TARBALL: ${{ steps.release.outputs.tarball }}
+          VENDOR_ROOT: ${{ steps.native.outputs.vendor_root }}
+        run: |
+          $metadata = (tar -xOf $env:TARBALL package/package.json | ConvertFrom-Json)
+          if ($metadata.name -ne $env:PACKAGE_NAME) {
+            throw "Unexpected package name '$($metadata.name)'."
+          }
+          if ($metadata.version -ne $env:RELEASE_VERSION) {
+            throw "Unexpected package version '$($metadata.version)'."
+          }
+          if ($metadata.bin.arcodex -ne "bin/codex.js") {
+            throw "The arcodex CLI entrypoint is missing."
+          }
+
+          $smokeRoot = Join-Path $env:RUNNER_TEMP "arcodex-smoke"
+          npm install --prefix $smokeRoot $env:TARBALL --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) {
+            throw "Isolated npm install failed."
+          }
+
+          $cli = Join-Path $smokeRoot "node_modules/.bin/arcodex.cmd"
+          $reportedVersion = (& $cli --version).Trim()
+          if ($LASTEXITCODE -ne 0) {
+            throw "Installed arcodex failed to start."
+          }
+          if ($reportedVersion -ne "codex-cli $env:CODEX_VERSION") {
+            throw "Unexpected CLI version '$reportedVersion'."
+          }
+
+          $installedExe = Join-Path $smokeRoot "node_modules/@ironbox/arcodex/vendor/$env:TARGET/bin/codex.exe"
+          $sourceExe = Join-Path $env:VENDOR_ROOT "$env:TARGET/bin/codex.exe"
+          $installedHash = (Get-FileHash -LiteralPath $installedExe -Algorithm SHA256).Hash
+          $sourceHash = (Get-FileHash -LiteralPath $sourceExe -Algorithm SHA256).Hash
+          if ($installedHash -ne $sourceHash) {
+            throw "Installed codex.exe does not match the release build."
+          }
+
+          Write-Host "Verified $env:PACKAGE_NAME@$env:RELEASE_VERSION"
+          Write-Host "CLI: $reportedVersion"
+          Write-Host "codex.exe SHA-256: $installedHash"
+
+      - name: Upload verified npm tarball
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: arcodex-npm-${{ steps.release.outputs.version }}
+          path: ${{ steps.release.outputs.tarball }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish package and update dist-tags
+        shell: pwsh
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          TARBALL: ${{ steps.release.outputs.tarball }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:NODE_AUTH_TOKEN)) {
+            throw "Repository secret NPM_TOKEN is not configured."
+          }
+
+          $tarballPath = (Resolve-Path -LiteralPath $env:TARBALL).Path
+          $localShasum = (Get-FileHash -LiteralPath $tarballPath -Algorithm SHA1).Hash.ToLowerInvariant()
+
+          $existingVersion = npm view "$env:PACKAGE_NAME@$env:RELEASE_VERSION" version --prefer-online 2>$null
+          if ($LASTEXITCODE -eq 0 -and $existingVersion.Trim() -eq $env:RELEASE_VERSION) {
+            $existingShasum = (npm view "$env:PACKAGE_NAME@$env:RELEASE_VERSION" dist.shasum --prefer-online).Trim()
+            if ($LASTEXITCODE -ne 0 -or $existingShasum -ne $localShasum) {
+              throw "Version already exists, but its registry shasum does not match this tarball."
+            }
+            Write-Host "$env:PACKAGE_NAME@$env:RELEASE_VERSION is already published with the same shasum."
+          } else {
+            npm publish $tarballPath --access public --tag arc
+            if ($LASTEXITCODE -ne 0) {
+              throw "npm publish failed."
+            }
+          }
+
+          npm dist-tag add "$env:PACKAGE_NAME@$env:RELEASE_VERSION" arc
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to update the arc dist-tag."
+          }
+          npm dist-tag add "$env:PACKAGE_NAME@$env:RELEASE_VERSION" latest
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to update the latest dist-tag."
+          }
+
+          $registryShasum = $null
+          for ($attempt = 1; $attempt -le 18; $attempt++) {
+            $candidate = npm view "$env:PACKAGE_NAME@$env:RELEASE_VERSION" dist.shasum --prefer-online 2>$null
+            if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($candidate)) {
+              $registryShasum = $candidate.Trim()
+              break
+            }
+            Write-Host "Waiting for npm registry propagation ($attempt/18)..."
+            Start-Sleep -Seconds 10
+          }
+
+          if ($registryShasum -ne $localShasum) {
+            throw "Published registry shasum '$registryShasum' does not match '$localShasum'."
+          }
+
+          npm view "$env:PACKAGE_NAME@$env:RELEASE_VERSION" name version dist-tags dist.shasum dist.integrity --json --prefer-online
+          if ($LASTEXITCODE -ne 0) {
+            throw "Final npm registry verification failed."
+          }
+
+      - name: Report sccache statistics
+        if: always()
+        shell: pwsh
+        run: sccache --show-stats
