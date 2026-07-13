@@ -14,7 +14,11 @@ use http::HeaderMap;
 use http::Method;
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::instrument;
+
+// The SSE body has a separate idle timeout; this only bounds the wait for HTTP headers.
+const MAX_STREAM_RESPONSE_HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) struct EndpointSession<T: HttpTransport> {
     transport: T,
@@ -135,6 +139,10 @@ impl<T: HttpTransport> EndpointSession<T> {
         configure(&mut request);
         let request = request.into_prepared().map_err(TransportError::Build)?;
         let make_request = || request.clone();
+        let response_headers_timeout = self
+            .provider
+            .stream_idle_timeout
+            .min(MAX_STREAM_RESPONSE_HEADERS_TIMEOUT);
 
         let stream = run_with_request_telemetry(
             self.provider.retry.to_policy(),
@@ -145,7 +153,12 @@ impl<T: HttpTransport> EndpointSession<T> {
                 let transport = &self.transport;
                 async move {
                     let req = auth.apply_auth(req).await.map_err(TransportError::from)?;
-                    transport.stream(req).await
+                    match tokio::time::timeout(response_headers_timeout, transport.stream(req))
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(TransportError::Timeout),
+                    }
                 }
             },
         )

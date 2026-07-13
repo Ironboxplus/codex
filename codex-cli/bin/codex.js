@@ -77,12 +77,23 @@ if (!platformPackage) {
 }
 
 function findCodexExecutable() {
+  const bundledVendorRoot = path.join(__dirname, "..", "vendor");
+  const bundledCodexExecutable = path.join(
+    bundledVendorRoot,
+    targetTriple,
+    "bin",
+    process.platform === "win32" ? "codex.exe" : "codex",
+  );
+  if (existsSync(bundledCodexExecutable)) {
+    return bundledCodexExecutable;
+  }
+
   let vendorRoot;
   try {
     const packageJsonPath = require.resolve(`${platformPackage}/package.json`);
     vendorRoot = path.join(path.dirname(packageJsonPath), "vendor");
   } catch {
-    vendorRoot = path.join(__dirname, "..", "vendor");
+    vendorRoot = bundledVendorRoot;
   }
 
   const codexExecutable = path.join(

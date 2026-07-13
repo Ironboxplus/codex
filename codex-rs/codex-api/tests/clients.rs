@@ -97,6 +97,34 @@ impl HttpTransport for RecordingTransport {
 }
 
 #[derive(Clone, Default)]
+struct PendingStreamTransport {
+    attempts: Arc<Mutex<usize>>,
+}
+
+impl PendingStreamTransport {
+    fn attempts(&self) -> usize {
+        *self
+            .attempts
+            .lock()
+            .expect("pending stream attempts mutex should not be poisoned")
+    }
+}
+
+impl HttpTransport for PendingStreamTransport {
+    async fn execute(&self, _req: Request) -> Result<Response, TransportError> {
+        Err(TransportError::Build("execute should not run".to_string()))
+    }
+
+    async fn stream(&self, _req: Request) -> Result<StreamResponse, TransportError> {
+        *self
+            .attempts
+            .lock()
+            .expect("pending stream attempts mutex should not be poisoned") += 1;
+        std::future::pending().await
+    }
+}
+
+#[derive(Clone, Default)]
 struct NoAuth;
 
 impl AuthProvider for NoAuth {
@@ -145,6 +173,34 @@ fn provider(name: &str) -> Provider {
         },
         stream_idle_timeout: Duration::from_millis(10),
     }
+}
+
+#[tokio::test]
+async fn responses_stream_times_out_while_waiting_for_response_headers() {
+    let transport = PendingStreamTransport::default();
+    let client = ResponsesClient::new(
+        transport.clone(),
+        provider("pending-response-headers"),
+        Arc::new(NoAuth),
+    );
+
+    let result = tokio::time::timeout(
+        Duration::from_millis(250),
+        client.stream(
+            serde_json::json!({"echo": true}),
+            HeaderMap::new(),
+            Compression::None,
+            /*turn_state*/ None,
+        ),
+    )
+    .await
+    .expect("response header wait should respect the stream idle timeout");
+
+    assert!(matches!(
+        result,
+        Err(ApiError::Transport(TransportError::Timeout))
+    ));
+    assert_eq!(transport.attempts(), 2);
 }
 
 #[derive(Debug, Default)]

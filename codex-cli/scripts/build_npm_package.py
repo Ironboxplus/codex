@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage and optionally package the @openai/codex npm module."""
+"""Stage and optionally package Codex CLI npm modules."""
 
 import argparse
 import json
@@ -16,6 +16,7 @@ REPO_ROOT = CODEX_CLI_ROOT.parent
 RESPONSES_API_PROXY_NPM_ROOT = REPO_ROOT / "codex-rs" / "responses-api-proxy" / "npm"
 CODEX_SDK_ROOT = REPO_ROOT / "sdk" / "typescript"
 CODEX_NPM_NAME = "@openai/codex"
+ARCODEX_NPM_NAME = "arcodex"
 CODEX_PACKAGE_COMPONENT = "codex-package"
 
 # `npm_name` is the local optional-dependency alias consumed by `bin/codex.js`.
@@ -71,6 +72,7 @@ PACKAGE_EXPANSIONS: dict[str, list[str]] = {
 
 PACKAGE_NATIVE_COMPONENTS: dict[str, list[str]] = {
     "codex": [],
+    "arcodex": [CODEX_PACKAGE_COMPONENT],
     "codex-linux-x64": [CODEX_PACKAGE_COMPONENT],
     "codex-linux-arm64": [CODEX_PACKAGE_COMPONENT],
     "codex-darwin-x64": [CODEX_PACKAGE_COMPONENT],
@@ -85,6 +87,7 @@ PACKAGE_TARGET_FILTERS: dict[str, str] = {
     package_name: package_config["target_triple"]
     for package_name, package_config in CODEX_PLATFORM_PACKAGES.items()
 }
+PACKAGE_TARGET_FILTERS["arcodex"] = "x86_64-pc-windows-msvc"
 
 PACKAGE_CHOICES = tuple(PACKAGE_NATIVE_COMPONENTS)
 
@@ -181,6 +184,13 @@ def main() -> int:
                     f"    node {staging_dir_str}/bin/codex.js --version\n"
                     f"    node {staging_dir_str}/bin/codex.js --help\n\n"
                 )
+            elif package == "arcodex":
+                print(
+                    f"Staged version {version} for release in {staging_dir_str}\n\n"
+                    "Verify arcodex:\n"
+                    f"    node {staging_dir_str}/bin/codex.js --version\n"
+                    f"    node {staging_dir_str}/bin/codex.js --help\n\n"
+                )
             elif package == "codex-responses-api-proxy":
                 print(
                     f"Staged version {version} for release in {staging_dir_str}\n\n"
@@ -230,7 +240,7 @@ def stage_sources(staging_dir: Path, version: str, package: str) -> None:
     package_json: dict
     package_json_path: Path | None = None
 
-    if package == "codex":
+    if package in {"codex", "arcodex"}:
         bin_dir = staging_dir / "bin"
         bin_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(CODEX_CLI_ROOT / "bin" / "codex.js", bin_dir / "codex.js")
@@ -301,6 +311,17 @@ def stage_sources(staging_dir: Path, version: str, package: str) -> None:
             for platform_package in PACKAGE_EXPANSIONS["codex"]
             if platform_package != "codex"
         }
+
+    elif package == "arcodex":
+        package_json["name"] = ARCODEX_NPM_NAME
+        package_json["description"] = (
+            "Self-contained Windows x64 Codex CLI build with response-header timeout handling."
+        )
+        package_json["bin"] = {"arcodex": "bin/codex.js"}
+        package_json["files"] = ["bin/codex.js", "vendor"]
+        package_json["os"] = ["win32"]
+        package_json["cpu"] = ["x64"]
+        package_json.pop("optionalDependencies", None)
 
     elif package == "codex-sdk":
         scripts = package_json.get("scripts")
@@ -410,6 +431,9 @@ def copy_native_binaries(
 def run_npm_pack(staging_dir: Path, output_path: Path) -> Path:
     output_path = output_path.resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    npm_command = shutil.which("npm")
+    if npm_command is None:
+        raise RuntimeError("npm executable not found on PATH.")
 
     with tempfile.TemporaryDirectory(prefix="codex-npm-pack-") as pack_dir_str:
         pack_dir = Path(pack_dir_str)
@@ -421,7 +445,7 @@ def run_npm_pack(staging_dir: Path, output_path: Path) -> Path:
         env["NPM_CONFIG_CACHE"] = str(npm_cache_dir)
         env["NPM_CONFIG_LOGS_DIR"] = str(npm_logs_dir)
         stdout = subprocess.check_output(
-            ["npm", "pack", "--json", "--pack-destination", str(pack_dir)],
+            [npm_command, "pack", "--json", "--pack-destination", str(pack_dir)],
             cwd=staging_dir,
             env=env,
             text=True,
