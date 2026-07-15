@@ -84,3 +84,184 @@ jobs:
       - name: Show compiler cache statistics
         if: always()
         run: sccache --show-stats
+
+  windows-package:
+    name: Build Windows x64 package
+    if: github.repository == 'Ironboxplus/codex'
+    runs-on: windows-latest
+    timeout-minutes: 240
+    env:
+      TARGET: x86_64-pc-windows-msvc
+      PACKAGE_NAME: "@ironbox/arcodex"
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.13"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: 24
+
+      - name: Configure CI directories
+        uses: ./.github/actions/setup-ci
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          toolchain: 1.95.0
+          targets: x86_64-pc-windows-msvc
+
+      - name: Configure MSVC environment
+        uses: ./.github/actions/setup-msvc-env
+        with:
+          target: x86_64-pc-windows-msvc
+
+      - name: Resolve artifact version
+        id: version
+        shell: pwsh
+        run: |
+          $cargoToml = Get-Content -LiteralPath "codex-rs/Cargo.toml" -Raw
+          $match = [regex]::Match(
+            $cargoToml,
+            '(?ms)^\[workspace\.package\]\s*$.*?^version\s*=\s*"(?<version>[^"]+)"'
+          )
+          if (-not $match.Success) {
+            throw "Could not read the workspace package version."
+          }
+          $cargoVersion = $match.Groups['version'].Value
+          $releaseVersion = "$cargoVersion-arc.${{ github.run_number }}"
+          $tarball = "dist/ironbox-arcodex-$releaseVersion-win32-x64.tgz"
+          "cargo_version=$cargoVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "release_version=$releaseVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "tarball=$tarball" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Restore Cargo download cache
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: arcodex-build-cargo-home-${{ runner.os }}-${{ hashFiles('codex-rs/Cargo.lock') }}
+          restore-keys: |
+            arcodex-build-cargo-home-${{ runner.os }}-
+
+      - name: Restore compiler cache
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: arcodex-build-sccache-${{ runner.os }}-${{ hashFiles('codex-rs/Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: |
+            arcodex-build-sccache-${{ runner.os }}-${{ hashFiles('codex-rs/Cargo.lock') }}-
+            arcodex-build-sccache-${{ runner.os }}-
+
+      - name: Install sccache
+        uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: sccache@0.12.0
+
+      - name: Configure compiler cache
+        shell: pwsh
+        run: |
+          $sccacheDir = Join-Path $env:GITHUB_WORKSPACE ".sccache"
+          New-Item -ItemType Directory -Path $sccacheDir -Force | Out-Null
+          "SCCACHE_GHA_ENABLED=false" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SCCACHE_DIR=$sccacheDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RUSTC_WRAPPER=sccache" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CARGO_BUILD_JOBS=$([Environment]::ProcessorCount)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $env:SCCACHE_GHA_ENABLED = "false"
+          $env:SCCACHE_DIR = $sccacheDir
+          sccache --start-server
+
+      - name: Build release executable
+        id: native
+        shell: pwsh
+        env:
+          LIBSQLITE3_FLAGS: SQLITE_DISABLE_INTRINSIC
+        run: |
+          $vendorRoot = Join-Path $env:RUNNER_TEMP "arcodex-vendor"
+          $packageDir = Join-Path $vendorRoot $env:TARGET
+          python scripts/build_codex_package.py `
+            --target $env:TARGET `
+            --variant codex `
+            --package-dir $packageDir `
+            --cargo-profile release
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows release build failed."
+          }
+          "vendor_root=$vendorRoot" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Build npm tarball
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.release_version }}
+          TARBALL: ${{ steps.version.outputs.tarball }}
+          VENDOR_ROOT: ${{ steps.native.outputs.vendor_root }}
+        run: |
+          New-Item -ItemType Directory -Path "dist" -Force | Out-Null
+          python codex-cli/scripts/build_npm_package.py `
+            --package arcodex `
+            --release-version $env:RELEASE_VERSION `
+            --vendor-src $env:VENDOR_ROOT `
+            --pack-output $env:TARBALL
+          if ($LASTEXITCODE -ne 0) {
+            throw "npm tarball build failed."
+          }
+          Copy-Item `
+            -LiteralPath (Join-Path $env:VENDOR_ROOT "$env:TARGET/bin/codex.exe") `
+            -Destination "dist/arcodex.exe"
+
+      - name: Verify built package
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.release_version }}
+          CODEX_VERSION: ${{ steps.version.outputs.cargo_version }}
+          TARBALL: ${{ steps.version.outputs.tarball }}
+        run: |
+          $metadata = (tar -xOf $env:TARBALL package/package.json | ConvertFrom-Json)
+          if ($metadata.name -ne $env:PACKAGE_NAME) {
+            throw "Unexpected package name '$($metadata.name)'."
+          }
+          if ($metadata.version -ne $env:RELEASE_VERSION) {
+            throw "Unexpected package version '$($metadata.version)'."
+          }
+          if ($metadata.bin.arcodex -ne "bin/codex.js") {
+            throw "The arcodex CLI entrypoint is missing."
+          }
+
+          $smokeRoot = Join-Path $env:RUNNER_TEMP "arcodex-smoke"
+          npm install --prefix $smokeRoot $env:TARBALL --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) {
+            throw "Isolated npm install failed."
+          }
+          $cli = Join-Path $smokeRoot "node_modules/.bin/arcodex.cmd"
+          $reportedVersion = (& $cli --version).Trim()
+          if ($LASTEXITCODE -ne 0) {
+            throw "Installed arcodex failed to start."
+          }
+          if ($reportedVersion -ne "codex-cli $env:CODEX_VERSION") {
+            throw "Unexpected CLI version '$reportedVersion'."
+          }
+
+      - name: Upload Windows build artifacts
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: arcodex-windows-x64-${{ steps.version.outputs.release_version }}
+          path: |
+            dist/arcodex.exe
+            ${{ steps.version.outputs.tarball }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Show compiler cache statistics
+        if: always()
+        shell: pwsh
+        run: sccache --show-stats
