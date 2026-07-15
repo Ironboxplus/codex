@@ -85,8 +85,6 @@ use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
-use codex_app_server_protocol::ThreadRollbackParams;
-use codex_app_server_protocol::ThreadRollbackResponse;
 use codex_app_server_protocol::ThreadSetNameParams;
 use codex_app_server_protocol::ThreadSetNameResponse;
 use codex_app_server_protocol::ThreadSettingsUpdateParams;
@@ -139,6 +137,12 @@ const JSONRPC_METHOD_NOT_FOUND: i64 = -32601;
 pub(crate) const EXTERNAL_AGENT_CONFIG_IMPORT_IN_PROGRESS_MESSAGE: &str =
     "A previous Claude Code import is still running. Wait for it to finish before importing again.";
 const THREAD_SETTINGS_UPDATE_METHOD: &str = "thread/settings/update";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ForkGoalContinuation {
+    StartIfIdle,
+    DeferUntilNextTurn,
+}
 
 fn bootstrap_request_error(context: &'static str, err: TypedRequestError) -> color_eyre::Report {
     color_eyre::eyre::eyre!("{context}: {err}")
@@ -429,7 +433,7 @@ impl AppServerSession {
                 request_id,
                 params: ExternalAgentConfigImportParams {
                     migration_items,
-                    source: None,
+                    source: Some("claude-code".to_string()),
                 },
             })
             .await
@@ -532,18 +536,42 @@ impl AppServerSession {
         config: Config,
         thread_id: ThreadId,
     ) -> Result<AppServerStartedThread> {
+        self.fork_thread_at(
+            config,
+            thread_id,
+            /*last_turn_id*/ None,
+            /*before_turn_id*/ None,
+            ForkGoalContinuation::StartIfIdle,
+        )
+        .await
+    }
+
+    pub(crate) async fn fork_thread_at(
+        &mut self,
+        config: Config,
+        thread_id: ThreadId,
+        last_turn_id: Option<String>,
+        before_turn_id: Option<String>,
+        goal_continuation: ForkGoalContinuation,
+    ) -> Result<AppServerStartedThread> {
         let request_id = self.next_request_id();
         let session_config = self.session_config_with_effective_service_tier(&config);
         let response: ThreadForkResponse = self
             .client
             .request_typed(ClientRequest::ThreadFork {
                 request_id,
-                params: thread_fork_params_from_config(
-                    session_config,
-                    thread_id,
-                    self.thread_params_mode(),
-                    self.remote_cwd_override.as_deref(),
-                ),
+                params: ThreadForkParams {
+                    last_turn_id,
+                    before_turn_id,
+                    defer_goal_continuation: goal_continuation
+                        == ForkGoalContinuation::DeferUntilNextTurn,
+                    ..thread_fork_params_from_config(
+                        session_config,
+                        thread_id,
+                        self.thread_params_mode(),
+                        self.remote_cwd_override.as_deref(),
+                    )
+                },
             })
             .await
             .map_err(|err| {
@@ -1091,24 +1119,6 @@ impl AppServerSession {
         Ok(())
     }
 
-    pub(crate) async fn thread_rollback(
-        &mut self,
-        thread_id: ThreadId,
-        num_turns: u32,
-    ) -> Result<ThreadRollbackResponse> {
-        let request_id = self.next_request_id();
-        self.client
-            .request_typed(ClientRequest::ThreadRollback {
-                request_id,
-                params: ThreadRollbackParams {
-                    thread_id: thread_id.to_string(),
-                    num_turns,
-                },
-            })
-            .await
-            .wrap_err("thread/rollback failed in TUI")
-    }
-
     pub(crate) async fn review_start(
         &mut self,
         thread_id: ThreadId,
@@ -1272,6 +1282,7 @@ fn model_preset_from_api_model(model: ApiModel) -> ModelPreset {
         is_default: model.is_default,
         upgrade,
         show_in_picker: !model.hidden,
+        multi_agent_version: None,
         availability_nux: model.availability_nux.map(|nux| ModelAvailabilityNux {
             message: nux.message,
         }),
@@ -1845,6 +1856,7 @@ mod tests {
             secondary: None,
             credits: None,
             individual_limit: None,
+            spend_control_reached: None,
             plan_type: None,
             rate_limit_reached_type: None,
         }
