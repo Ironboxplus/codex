@@ -237,8 +237,9 @@ jobs:
             throw "The arcodex CLI entrypoint is missing."
           }
 
+          $tarballPath = (Resolve-Path -LiteralPath $env:TARBALL).Path
           $smokeRoot = Join-Path $env:RUNNER_TEMP "arcodex-smoke"
-          npm install --prefix $smokeRoot $env:TARBALL --no-audit --no-fund
+          npm install --prefix $smokeRoot $tarballPath --no-audit --no-fund
           if ($LASTEXITCODE -ne 0) {
             throw "Isolated npm install failed."
           }
