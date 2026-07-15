@@ -1,0 +1,86 @@
+name: arcodex-ci
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "fix/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: arcodex-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  targeted-rust:
+    name: Format and targeted Rust tests
+    if: github.repository == 'Ironboxplus/codex'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    defaults:
+      run:
+        working-directory: codex-rs
+    env:
+      CARGO_INCREMENTAL: "0"
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      RUSTC_WRAPPER: sccache
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Configure CI directories
+        uses: ./.github/actions/setup-ci
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          toolchain: 1.95.0
+          components: rustfmt
+
+      - name: Restore Cargo download cache
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: arcodex-ci-cargo-home-${{ runner.os }}-${{ hashFiles('codex-rs/Cargo.lock') }}
+          restore-keys: |
+            arcodex-ci-cargo-home-${{ runner.os }}-
+
+      - name: Restore compiler cache
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: arcodex-ci-sccache-${{ runner.os }}-${{ hashFiles('codex-rs/Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: |
+            arcodex-ci-sccache-${{ runner.os }}-${{ hashFiles('codex-rs/Cargo.lock') }}-
+            arcodex-ci-sccache-${{ runner.os }}-
+
+      - name: Install sccache
+        uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: sccache@0.12.0
+
+      - name: Start compiler cache
+        run: sccache --start-server
+
+      - name: Check Rust formatting
+        run: cargo fmt -- --config imports_granularity=Item --check
+
+      - name: Test codex-api
+        run: cargo test -p codex-api
+
+      - name: Test guaranteed in-process delivery
+        run: |
+          cargo test -p codex-app-server item_completed_waits_for_event_queue_capacity --lib
+          cargo test -p codex-app-server guaranteed_delivery_helpers_cover_terminal_server_notifications --lib
+
+      - name: Show compiler cache statistics
+        if: always()
+        run: sccache --show-stats
